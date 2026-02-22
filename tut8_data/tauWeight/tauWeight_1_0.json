@@ -1,0 +1,25 @@
+{
+  "simConfig": {
+    "synMechTau2": 5.0,
+    "connWeight": 0.005,
+    "duration": 1000.0,
+    "dt": 0.025
+  },
+  "simData": {
+    "avgRate": 1.45
+  },
+  "popRates": {
+    "S": 1.0,
+    "M": 1.9
+  },
+  "net": {
+    "pops": {
+      "S": {
+        "numCells": 20
+      },
+      "M": {
+        "numCells": 20
+      }
+    }
+  }
+}

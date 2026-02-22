@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pyo
+x86_64/
+*.egg-info/
+.ipynb_checkpoints/
