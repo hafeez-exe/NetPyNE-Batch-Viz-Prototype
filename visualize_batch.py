@@ -180,6 +180,7 @@ def plot_rate_difference(df, save_path='figures/rate_diff_heatmap.png'):
 if __name__ == '__main__':
     print('Loading batch results...')
     df = load_batch_results()
+    df.to_csv("tut8_data/fitness_table.csv", index=False)
     print(f'Loaded {len(df)} configurations\n')
     print(df[['synMechTau2', 'connWeight', 'S_rate', 'M_rate']].to_string(index=False))
     print()

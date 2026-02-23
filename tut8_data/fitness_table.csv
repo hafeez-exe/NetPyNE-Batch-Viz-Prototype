@@ -1,0 +1,10 @@
+synMechTau2,connWeight,S_rate,M_rate,avg_rate,sim_label
+3.0,0.005,1.0,1.95,1.48,tauWeight_0_0
+3.0,0.01,1.0,2.0,1.5,tauWeight_0_1
+3.0,0.15,1.0,4.1,2.55,tauWeight_0_2
+5.0,0.005,1.0,1.9,1.45,tauWeight_1_0
+5.0,0.01,1.0,3.0,2.0,tauWeight_1_1
+5.0,0.15,1.0,3.25,2.12,tauWeight_1_2
+7.0,0.005,1.0,1.95,1.48,tauWeight_2_0
+7.0,0.01,1.05,4.45,2.75,tauWeight_2_1
+7.0,0.15,1.0,3.05,2.02,tauWeight_2_2
