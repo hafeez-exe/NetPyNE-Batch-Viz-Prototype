@@ -1,53 +1,67 @@
-"""
-Reads the batch simulation output from tut8_data/tauWeight/ and
-generates a heatmap showing how synMechTau2 and connWeight affect
-the M-population firing rate.
-
-Usage:
-    python visualize_batch.py
-"""
-
 import json
 import os
+from dataclasses import dataclass
+from itertools import product
+from collections import OrderedDict
+from typing import Optional, List, Dict, Any
+
 import numpy as np
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
-from itertools import product
-from collections import OrderedDict
 
 
-def load_batch_results(data_folder='tut8_data', batch_label='tauWeight'):
+@dataclass
+class VisualizationConfig:
+    """Configuration for batch visualization data loading and export.
+
+    Attributes:
+        data_folder: Root directory containing batch JSONs.
+        batch_label: Label forming the prefix of the batch folder and JSON files.
+        figures_dir: Output directory for saving heatmaps.
     """
-    Read the batch metadata and all individual simulation JSONs.
-    Returns a DataFrame with one row per parameter combination.
+    data_folder: str = 'tut8_data'
+    batch_label: str = 'tauWeight'
+    figures_dir: str = 'figures'
+
+
+def load_batch_results(config: Optional[VisualizationConfig] = None) -> pd.DataFrame:
+    """Read batch metadata and parse simulation JSON payloads into a DataFrame.
+
+    Args:
+        config: Data loading configuration settings.
+
+    Returns:
+        A DataFrame structure containing parameter variables and resulting firing rates.
     """
-    meta_path = os.path.join(data_folder, f'{batch_label}_batch.json')
+    if config is None:
+        config = VisualizationConfig()
+
+    meta_path = os.path.join(config.data_folder, f'{config.batch_label}_batch.json')
     with open(meta_path, 'r') as f:
         meta = json.load(f)['batch']
 
-    params = meta['params']
+    params = meta.get('params', [])
     param_labels = [p['label'] for p in params]
     param_values = [p['values'] for p in params]
 
-    rows = []
+    rows: List[Dict[str, Any]] = []
+
     for indices in product(*[range(len(v)) for v in param_values]):
         combo_str = '_'.join(str(i) for i in indices)
-        sim_label = f'{batch_label}_{combo_str}'
-        sim_path = os.path.join(data_folder, batch_label, f'{sim_label}.json')
+        sim_label = f'{config.batch_label}_{combo_str}'
+        sim_path = os.path.join(config.data_folder, config.batch_label, f'{sim_label}.json')
 
         try:
             with open(sim_path, 'r') as f:
                 result = json.load(f, object_pairs_hook=OrderedDict)
         except FileNotFoundError:
-            print(f'  warning: {sim_path} not found, skipping')
             continue
 
-        row = {}
+        row: Dict[str, Any] = {}
         for label, vals, idx in zip(param_labels, param_values, indices):
             row[label] = vals[idx]
 
-        # grab population firing rates
         pop_rates = result.get('popRates', {})
         for pop_name, rate in pop_rates.items():
             row[f'{pop_name}_rate'] = rate
@@ -59,9 +73,15 @@ def load_batch_results(data_folder='tut8_data', batch_label='tauWeight'):
     return pd.DataFrame(rows)
 
 
-def plot_firing_rate_heatmap(df, save_path='figures/fitness_heatmap.png'):
-    """
-    Create a heatmap: synMechTau2 (y) vs connWeight (x), color = M-pop rate.
+def plot_firing_rate_heatmap(
+    df: pd.DataFrame,
+    save_path: str = "figures/fitness_heatmap.png"
+) -> None:
+    """Render and save a heatmap showing M-population rates mapped to scanned parameters.
+
+    Args:
+        df: Merged output DataFrame linking parameters to recorded rates.
+        save_path: Target generic output graph filepath.
     """
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
@@ -96,13 +116,18 @@ def plot_firing_rate_heatmap(df, save_path='figures/fitness_heatmap.png'):
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    print(f'Saved heatmap → {save_path}')
-    plt.close()
+    plt.close(fig)
 
 
-def plot_dual_population(df, save_path='figures/dual_pop_heatmap.png'):
-    """
-    Side-by-side heatmaps for S and M populations.
+def plot_dual_population(
+    df: pd.DataFrame,
+    save_path: str = "figures/dual_pop_heatmap.png"
+) -> None:
+    """Render side-by-side comparative heatmaps displaying distinct S vs M population data.
+
+    Args:
+        df: Merged output DataFrame handling experimental recordings.
+        save_path: Output graph destination string.
     """
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
@@ -133,20 +158,25 @@ def plot_dual_population(df, save_path='figures/dual_pop_heatmap.png'):
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    print(f'Saved dual heatmap → {save_path}')
-    plt.close()
+    plt.close(fig)
 
 
-def plot_rate_difference(df, save_path='figures/rate_diff_heatmap.png'):
-    """
-    Heatmap of M_rate - S_rate, showing how much the downstream
-    population is driven by each parameter combination.
+def plot_rate_difference(
+    df: pd.DataFrame,
+    save_path: str = "figures/rate_diff_heatmap.png"
+) -> None:
+    """Compute and distribute subtracted rate matrix indicating driver impact (M minus S).
+
+    Args:
+        df: Processed recording sets holding populations.
+        save_path: Relative string destination defining output folder location.
     """
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
-    df['rate_diff'] = df['M_rate'] - df['S_rate']
+    df_copy = df.copy()
+    df_copy['rate_diff'] = df_copy['M_rate'] - df_copy['S_rate']
 
-    pivot = df.pivot_table(values='rate_diff', index='synMechTau2', columns='connWeight')
+    pivot = df_copy.pivot_table(values='rate_diff', index='synMechTau2', columns='connWeight')
 
     fig, ax = plt.subplots(figsize=(8, 6))
 
@@ -173,20 +203,15 @@ def plot_rate_difference(df, save_path='figures/rate_diff_heatmap.png'):
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    print(f'Saved rate difference heatmap → {save_path}')
-    plt.close()
+    plt.close(fig)
 
 
 if __name__ == '__main__':
-    print('Loading batch results...')
-    df = load_batch_results()
-    df.to_csv("tut8_data/fitness_table.csv", index=False)
-    print(f'Loaded {len(df)} configurations\n')
-    print(df[['synMechTau2', 'connWeight', 'S_rate', 'M_rate']].to_string(index=False))
-    print()
+    config = VisualizationConfig()
+    df_results = load_batch_results(config)
+    csv_path = os.path.join(config.data_folder, "fitness_table.csv")
+    df_results.to_csv(csv_path, index=False)
 
-    plot_firing_rate_heatmap(df)
-    plot_dual_population(df)
-    plot_rate_difference(df)
-
-    print('\nAll figures saved to figures/')
+    plot_firing_rate_heatmap(df_results)
+    plot_dual_population(df_results)
+    plot_rate_difference(df_results)

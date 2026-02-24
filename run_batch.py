@@ -1,113 +1,235 @@
-"""
-Standalone batch simulation that sweeps synMechTau2 x connWeight,
-runs a minimal Hodgkin-Huxley network for each combo, and saves
-results in NetPyNE-compatible JSON format.
-
-No NEURON dependency — uses a pure-numpy HH solver so we can run
-on any Python version. The physics is the same single-compartment
-HH model that the tut8 tutorial uses.
-"""
-
 import json
 import os
-import numpy as np
+import warnings
+from dataclasses import dataclass
+from typing import Dict, List, Optional
 from itertools import product
 
+import numpy as np
 
-# ── Hodgkin-Huxley single-compartment model ─────────────────────
-
-# membrane parameters (same as NetPyNE tut8 PYR cell)
-C_m = 1.0       # uF/cm^2
-g_Na = 120.0    # mS/cm^2 (gnabar=0.12 S/cm^2 = 120 mS/cm^2)
-g_K = 36.0
-g_L = 3.0
-E_Na = 50.0     # mV
-E_K = -77.0
-E_L = -54.387
+warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 
-def alpha_n(V):
-    dV = V + 55.0
-    # guard against division by zero near dV=0
-    mask = np.abs(dV) < 1e-7
-    result = np.where(mask, 0.1, 0.01 * dV / (1.0 - np.exp(-dV / 10.0)))
+@dataclass
+class HHParams:
+    """Hodgkin-Huxley single-compartment parameters.
+
+    Attributes:
+        C_m: Membrane capacitance (uF/cm^2).
+        g_Na: Maximum sodium conductance (mS/cm^2).
+        g_K: Maximum potassium conductance (mS/cm^2).
+        g_L: Maximum leak conductance (mS/cm^2).
+        E_Na: Sodium reversal potential (mV).
+        E_K: Potassium reversal potential (mV).
+        E_L: Leak reversal potential (mV).
+    """
+    C_m: float = 1.0
+    g_Na: float = 120.0
+    g_K: float = 36.0
+    g_L: float = 3.0
+    E_Na: float = 50.0
+    E_K: float = -77.0
+    E_L: float = -54.387
+
+
+@dataclass
+class SimulationConfig:
+    """Configuration for a single network simulation run.
+
+    Attributes:
+        duration_ms: Total duration of the simulation in milliseconds.
+        dt: Integration time step in milliseconds.
+        n_s: Number of sensory (S) cells.
+        n_m: Number of motor (M) cells.
+        connection_prob: Probability of connection from S to M cells.
+        bkg_rate_hz: Background Poisson input rate in Hz.
+        bkg_amplitude: Background Poisson input amplitude.
+        spike_threshold: Membrane potential threshold for spike detection (mV).
+    """
+    duration_ms: float = 1000.0
+    dt: float = 0.025
+    n_s: int = 20
+    n_m: int = 20
+    connection_prob: float = 0.5
+    bkg_rate_hz: float = 10.0
+    bkg_amplitude: float = 8.0
+    spike_threshold: float = -20.0
+
+
+@dataclass
+class BatchConfig:
+    """Configuration for the batch sweep.
+
+    Attributes:
+        tau2_values: List of synaptic decay time constants to explore.
+        weight_values: List of synaptic weights to explore.
+        batch_label: Label for the batch run.
+        save_folder: Output directory name.
+    """
+    tau2_values: List[float]
+    weight_values: List[float]
+    batch_label: str = "tauWeight"
+    save_folder: str = "tut8_data"
+
+
+def alpha_n(v_m: np.ndarray) -> np.ndarray:
+    """Calculate alpha_n rate constant for the Hodgkin-Huxley system.
+
+    Args:
+        v_m: Array of membrane potentials.
+
+    Returns:
+        Array of rate constants.
+    """
+    dv = v_m + 55.0
+    mask = np.abs(dv) < 1e-7
+    with np.errstate(divide='ignore', invalid='ignore'):
+        result = np.where(mask, 0.1, 0.01 * dv / (1.0 - np.exp(-dv / 10.0)))
     return result
 
-def beta_n(V):
-    return 0.125 * np.exp(-(V + 65.0) / 80.0)
 
-def alpha_m(V):
-    dV = V + 40.0
-    mask = np.abs(dV) < 1e-7
-    return np.where(mask, 1.0, 0.1 * dV / (1.0 - np.exp(-dV / 10.0)))
+def beta_n(v_m: np.ndarray) -> np.ndarray:
+    """Calculate beta_n rate constant for the Hodgkin-Huxley system.
 
-def beta_m(V):
-    return 4.0 * np.exp(-(V + 65.0) / 18.0)
+    Args:
+        v_m: Array of membrane potentials.
 
-def alpha_h(V):
-    return 0.07 * np.exp(-(V + 65.0) / 20.0)
-
-def beta_h(V):
-    return 1.0 / (1.0 + np.exp(-(V + 35.0) / 10.0))
-
-
-def run_hh_network(n_cells, dt, duration, I_ext_per_cell, syn_tau2, syn_weight,
-                   connectivity_matrix, E_syn=0.0, syn_tau1=0.1, rng=None):
+    Returns:
+        Array of rate constants.
     """
-    Simulate n_cells HH neurons with Exp2Syn-style synaptic coupling.
+    return 0.125 * np.exp(-(v_m + 65.0) / 80.0)
 
-    Returns dict with spike times per cell and population avg firing rates.
+
+def alpha_m(v_m: np.ndarray) -> np.ndarray:
+    """Calculate alpha_m rate constant for the Hodgkin-Huxley system.
+
+    Args:
+        v_m: Array of membrane potentials.
+
+    Returns:
+        Array of rate constants.
+    """
+    dv = v_m + 40.0
+    mask = np.abs(dv) < 1e-7
+    with np.errstate(divide='ignore', invalid='ignore'):
+        result = np.where(mask, 1.0, 0.1 * dv / (1.0 - np.exp(-dv / 10.0)))
+    return result
+
+
+def beta_m(v_m: np.ndarray) -> np.ndarray:
+    """Calculate beta_m rate constant for the Hodgkin-Huxley system.
+
+    Args:
+        v_m: Array of membrane potentials.
+
+    Returns:
+        Array of rate constants.
+    """
+    return 4.0 * np.exp(-(v_m + 65.0) / 18.0)
+
+
+def alpha_h(v_m: np.ndarray) -> np.ndarray:
+    """Calculate alpha_h rate constant for the Hodgkin-Huxley system.
+
+    Args:
+        v_m: Array of membrane potentials.
+
+    Returns:
+        Array of rate constants.
+    """
+    return 0.07 * np.exp(-(v_m + 65.0) / 20.0)
+
+
+def beta_h(v_m: np.ndarray) -> np.ndarray:
+    """Calculate beta_h rate constant for the Hodgkin-Huxley system.
+
+    Args:
+        v_m: Array of membrane potentials.
+
+    Returns:
+        Array of rate constants.
+    """
+    return 1.0 / (1.0 + np.exp(-(v_m + 35.0) / 10.0))
+
+
+def run_hh_network(
+    n_cells: int,
+    dt: float,
+    duration: float,
+    i_ext_per_cell: np.ndarray,
+    syn_tau2: float,
+    syn_weight: float,
+    connectivity_matrix: np.ndarray,
+    e_syn: float = 0.0,
+    syn_tau1: float = 0.1,
+    rng: Optional[np.random.Generator] = None,
+    params: Optional[HHParams] = None,
+    spike_threshold: float = -20.0
+) -> Dict[int, List[float]]:
+    """Simulate a network of Hodgkin-Huxley neurons with Exp2Syn coupling.
+
+    Args:
+        n_cells: Number of cells in the network.
+        dt: Integration time step in ms.
+        duration: Total duration of simulation in ms.
+        i_ext_per_cell: 2D array of external current injection [cell, time].
+        syn_tau2: Synaptic decay time constant.
+        syn_weight: Synaptic weight.
+        connectivity_matrix: 2D array representing synaptic connectivity.
+        e_syn: Synaptic reversal potential.
+        syn_tau1: Synaptic rise time constant.
+        rng: NumPy random generator instance.
+        params: Hodgkin-Huxley parameters dataclass instance.
+        spike_threshold: Membrane potential required to register a spike.
+
+    Returns:
+        Dictionary mapping cell index to a list of spike times.
     """
     if rng is None:
         rng = np.random.default_rng(42)
 
+    if params is None:
+        params = HHParams()
+
     steps = int(duration / dt)
     t = np.arange(steps) * dt
 
-    V = np.full(n_cells, -65.0)
-    n = alpha_n(V) / (alpha_n(V) + beta_n(V))
-    m = alpha_m(V) / (alpha_m(V) + beta_m(V))
-    h = alpha_h(V) / (alpha_h(V) + beta_h(V))
+    v_m = np.full(n_cells, -65.0)
+    n = alpha_n(v_m) / (alpha_n(v_m) + beta_n(v_m))
+    m = alpha_m(v_m) / (alpha_m(v_m) + beta_m(v_m))
+    h = alpha_h(v_m) / (alpha_h(v_m) + beta_h(v_m))
 
-    # dual-exponential synapse state variables
     g_syn = np.zeros(n_cells)
     s_rise = np.zeros(n_cells)
     s_decay = np.zeros(n_cells)
 
-    spikes = {i: [] for i in range(n_cells)}
-    refractory = np.zeros(n_cells)  # refractory timer
-    spike_threshold = -20.0
+    spikes: Dict[int, List[float]] = {i: [] for i in range(n_cells)}
+    refractory = np.zeros(n_cells)
 
     for step in range(1, steps):
         ti = t[step]
 
-        # gate kinetics
-        an, bn = alpha_n(V), beta_n(V)
-        am, bm = alpha_m(V), beta_m(V)
-        ah, bh = alpha_h(V), beta_h(V)
+        an, bn = alpha_n(v_m), beta_n(v_m)
+        am, bm = alpha_m(v_m), beta_m(v_m)
+        ah, bh = alpha_h(v_m), beta_h(v_m)
 
-        n += dt * (an * (1 - n) - bn * n)
-        m += dt * (am * (1 - m) - bm * m)
-        h += dt * (ah * (1 - h) - bh * h)
+        n += dt * (an * (1.0 - n) - bn * n)
+        m += dt * (am * (1.0 - m) - bm * m)
+        h += dt * (ah * (1.0 - h) - bh * h)
 
-        # clamp gating variables to [0, 1]
-        n = np.clip(n, 0, 1)
-        m = np.clip(m, 0, 1)
-        h = np.clip(h, 0, 1)
+        n = np.clip(n, 0.0, 1.0)
+        m = np.clip(m, 0.0, 1.0)
+        h = np.clip(h, 0.0, 1.0)
 
-        # ionic currents
-        I_Na = g_Na * m**3 * h * (V - E_Na)
-        I_K = g_K * n**4 * (V - E_K)
-        I_L = g_L * (V - E_L)
+        i_na = params.g_Na * (m**3) * h * (v_m - params.E_Na)
+        i_k = params.g_K * (n**4) * (v_m - params.E_K)
+        i_l = params.g_L * (v_m - params.E_L)
 
-        # synaptic current (Exp2Syn model)
-        I_syn = g_syn * (V - E_syn)
+        i_syn = g_syn * (v_m - e_syn)
 
-        # membrane equation
-        dVdt = (I_ext_per_cell[:, step] - I_Na - I_K - I_L - I_syn) / C_m
-        V += dt * dVdt
+        dvdt = (i_ext_per_cell[:, step] - i_na - i_k - i_l - i_syn) / params.C_m
+        v_m += dt * dvdt
 
-        # update synaptic conductance (dual exponential)
         if syn_tau1 > 0 and syn_tau2 > syn_tau1:
             s_rise *= np.exp(-dt / syn_tau1)
             s_decay *= np.exp(-dt / syn_tau2)
@@ -115,15 +237,13 @@ def run_hh_network(n_cells, dt, duration, I_ext_per_cell, syn_tau2, syn_weight,
         else:
             g_syn *= np.exp(-dt / syn_tau2)
 
-        # spike detection
-        refractory = np.maximum(refractory - dt, 0)
-        spiking = (V > spike_threshold) & (refractory <= 0)
+        refractory = np.maximum(refractory - dt, 0.0)
+        spiking = (v_m > spike_threshold) & (refractory <= 0.0)
 
         for idx in np.where(spiking)[0]:
             spikes[idx].append(ti)
-            refractory[idx] = 2.0  # 2ms refractory period
+            refractory[idx] = 2.0
 
-            # propagate spike to postsynaptic targets
             post_cells = np.where(connectivity_matrix[idx] > 0)[0]
             for post in post_cells:
                 weight = connectivity_matrix[idx, post] * syn_weight
@@ -133,131 +253,166 @@ def run_hh_network(n_cells, dt, duration, I_ext_per_cell, syn_tau2, syn_weight,
     return spikes
 
 
-def generate_poisson_input(n_cells, rate_hz, duration_ms, dt, amplitude, rng):
-    """Generate Poisson-process current injection for each cell."""
+def generate_poisson_input(
+    n_cells: int,
+    rate_hz: float,
+    duration_ms: float,
+    dt: float,
+    amplitude: float,
+    rng: np.random.Generator
+) -> np.ndarray:
+    """Generate Poisson-process current injection for each cell.
+
+    Args:
+        n_cells: Number of cells receiving input.
+        rate_hz: Mean firing rate of the Poisson process.
+        duration_ms: Total duration of the simulation in ms.
+        dt: Integration time step in ms.
+        amplitude: Amplitude of the current pulse injected upon an event.
+        rng: NumPy random generator instance.
+
+    Returns:
+        2D array of external currents [cell, time].
+    """
     steps = int(duration_ms / dt)
-    I = np.zeros((n_cells, steps))
+    i_ext = np.zeros((n_cells, steps))
 
     for cell in range(n_cells):
-        # poisson spike times
-        n_expected = int(rate_hz * duration_ms / 1000 * 2)
+        n_expected = int(rate_hz * duration_ms / 1000.0 * 2.0)
         isis = rng.exponential(1000.0 / rate_hz, size=n_expected)
         spike_times = np.cumsum(isis)
         spike_times = spike_times[spike_times < duration_ms]
 
         for st in spike_times:
             idx = int(st / dt)
-            # brief current pulse (1ms duration)
             end = min(idx + int(1.0 / dt), steps)
-            I[cell, idx:end] += amplitude
+            i_ext[cell, idx:end] += amplitude
 
-    return I
+    return i_ext
 
 
-def run_single_config(syn_tau2, conn_weight, seed=42):
+def run_single_config(
+    syn_tau2: float,
+    conn_weight: float,
+    seed: int = 42,
+    config: Optional[SimulationConfig] = None
+) -> Dict[str, float]:
+    """Execute one parameter configuration for the population.
+
+    Args:
+        syn_tau2: Synaptic decay time constant.
+        conn_weight: Connection weight scalar.
+        seed: Random seed for reproducibility.
+        config: SimulationConfig dataclass instance.
+
+    Returns:
+        Dictionary containing the mean firing rate (Hz) for S and M populations.
     """
-    Run one parameter configuration: 40 HH cells (20 'S' + 20 'M'),
-    S->M connectivity at 50% probability. Returns pop firing rates.
-    """
+    if config is None:
+        config = SimulationConfig()
+
     rng = np.random.default_rng(seed)
+    n_total = config.n_s + config.n_m
 
-    n_S, n_M = 20, 20
-    n_total = n_S + n_M
-    dt = 0.025    # ms
-    duration = 1000.0  # ms
-
-    # S->M connectivity with 50% probability
     conn = np.zeros((n_total, n_total))
-    for pre in range(n_S):
-        for post in range(n_S, n_total):
-            if rng.random() < 0.5:
+    for pre in range(config.n_s):
+        for post in range(config.n_s, n_total):
+            if rng.random() < config.connection_prob:
                 conn[pre, post] = 1.0
 
-    # background poisson drive at 10 Hz, ~same as tut8 bkg NetStim
-    bkg_current = generate_poisson_input(n_total, 10.0, duration, dt, 8.0, rng)
+    bkg_current = generate_poisson_input(
+        n_cells=n_total,
+        rate_hz=config.bkg_rate_hz,
+        duration_ms=config.duration_ms,
+        dt=config.dt,
+        amplitude=config.bkg_amplitude,
+        rng=rng
+    )
 
     spikes = run_hh_network(
         n_cells=n_total,
-        dt=dt,
-        duration=duration,
-        I_ext_per_cell=bkg_current,
+        dt=config.dt,
+        duration=config.duration_ms,
+        i_ext_per_cell=bkg_current,
         syn_tau2=syn_tau2,
-        syn_weight=conn_weight * 1000,  # scale weight for conductance units
+        syn_weight=conn_weight * 1000.0,
         connectivity_matrix=conn,
-        E_syn=0.0,
-        syn_tau1=0.1,
         rng=rng,
+        spike_threshold=config.spike_threshold
     )
 
-    # compute firing rates per population (Hz)
-    dur_sec = duration / 1000.0
-    S_rates = [len(spikes[i]) / dur_sec for i in range(n_S)]
-    M_rates = [len(spikes[i]) / dur_sec for i in range(n_S, n_total)]
+    dur_sec = config.duration_ms / 1000.0
+    s_rates = [len(spikes[i]) / dur_sec for i in range(config.n_s)]
+    m_rates = [len(spikes[i]) / dur_sec for i in range(config.n_s, n_total)]
 
     return {
-        'S': round(np.mean(S_rates), 2),
-        'M': round(np.mean(M_rates), 2),
+        'S': round(float(np.mean(s_rates)), 2),
+        'M': round(float(np.mean(m_rates)), 2),
     }
 
 
-def run_batch():
-    """
-    Grid search over synMechTau2 x connWeight, matching the tut8 tutorial.
-    Saves results as JSON files in tut8_data/tauWeight/.
-    """
-    tau2_values = [3.0, 5.0, 7.0]
-    weight_values = [0.005, 0.01, 0.15]
+def run_batch(config: Optional[BatchConfig] = None) -> None:
+    """Execute grid search parameter sweep and export data to JSON limits.
 
-    batch_label = 'tauWeight'
-    save_folder = 'tut8_data'
-    out_dir = os.path.join(save_folder, batch_label)
+    Args:
+        config: BatchConfig dataclass instance containing sweep parameters.
+    """
+    if config is None:
+        config = BatchConfig(
+            tau2_values=[3.0, 5.0, 7.0],
+            weight_values=[0.005, 0.01, 0.15]
+        )
+
+    sim_cfg = SimulationConfig()
+    out_dir = os.path.join(config.save_folder, config.batch_label)
     os.makedirs(out_dir, exist_ok=True)
 
     param_combos = list(product(
-        enumerate(tau2_values),
-        enumerate(weight_values),
+        enumerate(config.tau2_values),
+        enumerate(config.weight_values)
     ))
 
-    # save batch metadata (mirrors NetPyNE's _batch.json)
     batch_meta = {
         'batch': {
-            'batchLabel': batch_label,
+            'batchLabel': config.batch_label,
             'saveFolder': out_dir,
             'method': 'grid',
             'params': [
-                {'label': 'synMechTau2', 'values': tau2_values},
-                {'label': 'connWeight', 'values': weight_values},
+                {'label': 'synMechTau2', 'values': config.tau2_values},
+                {'label': 'connWeight', 'values': config.weight_values},
             ],
         }
     }
-    meta_path = os.path.join(save_folder, f'{batch_label}_batch.json')
+
+    meta_path = os.path.join(config.save_folder, f'{config.batch_label}_batch.json')
     with open(meta_path, 'w') as f:
         json.dump(batch_meta, f, indent=2)
 
-    print(f'Running {len(param_combos)} parameter combinations...\n')
-
     for (i_tau, tau2), (i_w, weight) in param_combos:
-        label = f'{batch_label}_{i_tau}_{i_w}'
-        print(f'  [{label}] tau2={tau2}, weight={weight} ...', end=' ', flush=True)
+        label = f'{config.batch_label}_{i_tau}_{i_w}'
+        
+        pop_rates = run_single_config(
+            syn_tau2=tau2,
+            conn_weight=weight,
+            seed=i_tau * 100 + i_w,
+            config=sim_cfg
+        )
 
-        pop_rates = run_single_config(tau2, weight, seed=i_tau * 100 + i_w)
-
-        # structure matches what NetPyNE actually saves
         result = {
             'simConfig': {
                 'synMechTau2': tau2,
                 'connWeight': weight,
-                'duration': 1000.0,
-                'dt': 0.025,
+                'duration': sim_cfg.duration_ms,
+                'dt': sim_cfg.dt,
             },
             'simData': {
-                'avgRate': round((pop_rates['S'] + pop_rates['M']) / 2, 2),
+                'avgRate': round((pop_rates['S'] + pop_rates['M']) / 2.0, 2),
             },
             'popRates': pop_rates,
             'net': {
                 'pops': {
-                    'S': {'numCells': 20},
-                    'M': {'numCells': 20},
+                    'S': {'numCells': sim_cfg.n_s},
+                    'M': {'numCells': sim_cfg.n_m},
                 },
             },
         }
@@ -265,11 +420,6 @@ def run_batch():
         out_path = os.path.join(out_dir, f'{label}.json')
         with open(out_path, 'w') as f:
             json.dump(result, f, indent=2)
-
-        print(f'S={pop_rates["S"]} Hz, M={pop_rates["M"]} Hz')
-
-    print(f'\nDone. Results saved to {out_dir}/')
-    print(f'Batch metadata: {meta_path}')
 
 
 if __name__ == '__main__':
